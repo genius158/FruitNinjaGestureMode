@@ -21,5 +21,13 @@ data class CropWindow(
             heightNorm = 1f,
         )
     }
+
+    fun set(expanded: CropWindow) {
+        centerXNorm = expanded.centerXNorm
+        centerYNorm = expanded.centerYNorm
+        widthNorm = expanded.widthNorm
+        heightNorm = expanded.heightNorm
+    }
+
 }
 

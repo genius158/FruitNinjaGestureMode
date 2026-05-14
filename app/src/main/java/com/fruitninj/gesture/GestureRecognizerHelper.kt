@@ -30,6 +30,7 @@ import androidx.annotation.VisibleForTesting
 import androidx.camera.core.ImageProxy
 import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.google.mediapipe.framework.image.MPImage
+import com.google.mediapipe.tasks.components.containers.NormalizedLandmark
 import com.google.mediapipe.tasks.core.BaseOptions
 import com.google.mediapipe.tasks.core.Delegate
 import com.google.mediapipe.tasks.vision.core.RunningMode
@@ -61,6 +62,13 @@ class GestureRecognizerHelper(
     // will not change, a lazy val would be preferable.
     private var gestureRecognizer: GestureRecognizer? = null
 
+    /**
+     * Dynamic crop optimizer. Non-null only while [isCropEnabled] is true.
+     * Created in [setCropEnabled](true) and destroyed in [setCropEnabled](false) / [clearGestureRecognizer].
+     * All accesses run on the single [backgroundExecutor] thread — no additional locking required.
+     */
+    private var cropOptimizer: CropOptimizer? = null
+
     private val reusableTransformMatrix = Matrix()
     private val reusableDrawMatrix = Matrix()
     private val reusableTransformedBounds = RectF()
@@ -77,12 +85,14 @@ class GestureRecognizerHelper(
     fun clearGestureRecognizer() {
         gestureRecognizer?.close()
         gestureRecognizer = null
+        cropOptimizer = null
         bitmapCache = null
         pendingFrameMetadata.clear()
     }
 
     fun setCropEnabled(enabled: Boolean) {
         isCropEnabled = enabled
+        cropOptimizer = if (enabled) CropOptimizer(cropWindow) else null
     }
 
 
@@ -219,7 +229,17 @@ class GestureRecognizerHelper(
         val fullFrameWidth = reusableTransformedBounds.width().roundToInt()
         val fullFrameHeight = reusableTransformedBounds.height().roundToInt()
 
-        val activeCropWindow = if (isCropEnabled) cropWindow else CropWindow.FULL_FRAME
+        // When crop is enabled, prefer the optimizer's dynamic window so the crop region
+        // adapts to hand-detection state.  Fall back to the static cropWindow if the
+        // optimizer has not been created yet.
+        // NOTE: 1-frame delay is expected — the optimizer is updated in returnLivestreamResult
+        // (result callback) after this frame has already been submitted for inference.
+        val activeCropWindow = if (isCropEnabled) {
+            cropOptimizer?.currentCropWindow ?: cropWindow
+        } else {
+            CropWindow.FULL_FRAME
+        }
+
         val minCropWidth = max(1, (fullFrameWidth * 0.2f).roundToInt())
         val minCropHeight = max(1, (fullFrameHeight * 0.2f).roundToInt())
         val targetCropWidth =
@@ -565,14 +585,31 @@ class GestureRecognizerHelper(
         val inferenceTime = finishTimeMs - result.timestampMs()
         val frameMetadata = pendingFrameMetadata.remove(result.timestampMs())
 
+        // Drive the optimizer with the current frame's hand-detection state.
+        // fullImageWidth/Height come from the pre-crop metadata stored in recognizeLiveStream;
+        // the fallback to input.width/height is a safety guard (input is the cropped bitmap,
+        // so this path should not be hit in normal operation).
+        val fullW = frameMetadata?.fullImageWidth ?: input.width
+        val fullH = frameMetadata?.fullImageHeight ?: input.height
+        val hasHand = hasDetectedHandInsideCrop(
+            result = result,
+            inputImageWidth = input.width,
+            inputImageHeight = input.height,
+            fullImageWidth = fullW,
+            fullImageHeight = fullH,
+            cropOffsetX = frameMetadata?.cropOffsetX ?: 0,
+            cropOffsetY = frameMetadata?.cropOffsetY ?: 0,
+        )
+        cropOptimizer?.updateCropOptimization(fullW, fullH, hasHand, result.timestampMs())
+
         gestureRecognizerListener?.onResults(
             ResultBundle(
                 listOf(result),
                 inferenceTime,
                 input.height,
                 input.width,
-                fullImageWidth = frameMetadata?.fullImageWidth ?: input.width,
-                fullImageHeight = frameMetadata?.fullImageHeight ?: input.height,
+                fullImageWidth = fullW,
+                fullImageHeight = fullH,
                 cropOffsetX = frameMetadata?.cropOffsetX ?: 0,
                 cropOffsetY = frameMetadata?.cropOffsetY ?: 0,
             )
@@ -588,6 +625,82 @@ class GestureRecognizerHelper(
         )
     }
 
+    /**
+     * A hand only counts as "present" for crop optimisation when MediaPipe detected a hand
+     * and that hand's representative point maps back inside the configured base crop window.
+     *
+     * Detection landmarks are normalized in the cropped-input coordinate space, so they must be
+     * projected back to full-frame normalized coordinates before comparing with [cropWindow].
+     */
+    private fun hasDetectedHandInsideCrop(
+        result: GestureRecognizerResult,
+        inputImageWidth: Int,
+        inputImageHeight: Int,
+        fullImageWidth: Int,
+        fullImageHeight: Int,
+        cropOffsetX: Int,
+        cropOffsetY: Int,
+    ): Boolean {
+        if (result.landmarks().isEmpty()) return false
+
+        if (!isCropEnabled) return true
+
+        val safeInputWidth = inputImageWidth.coerceAtLeast(1)
+        val safeInputHeight = inputImageHeight.coerceAtLeast(1)
+        val safeFullWidth = fullImageWidth.coerceAtLeast(1)
+        val safeFullHeight = fullImageHeight.coerceAtLeast(1)
+
+        val cropLeft = cropWindow.centerXNorm - cropWindow.widthNorm / 2f
+        val cropTop = cropWindow.centerYNorm - cropWindow.heightNorm / 2f
+        val cropRight = cropWindow.centerXNorm + cropWindow.widthNorm / 2f
+        val cropBottom = cropWindow.centerYNorm + cropWindow.heightNorm / 2f
+
+        return result.landmarks().any { handLandmarks ->
+            isHandRepresentativePointInsideCrop(
+                handLandmarks = handLandmarks,
+                inputImageWidth = safeInputWidth,
+                inputImageHeight = safeInputHeight,
+                fullImageWidth = safeFullWidth,
+                fullImageHeight = safeFullHeight,
+                cropOffsetX = cropOffsetX,
+                cropOffsetY = cropOffsetY,
+                cropLeft = cropLeft,
+                cropTop = cropTop,
+                cropRight = cropRight,
+                cropBottom = cropBottom,
+            )
+        }
+    }
+
+    private fun isHandRepresentativePointInsideCrop(
+        handLandmarks: List<NormalizedLandmark>,
+        inputImageWidth: Int,
+        inputImageHeight: Int,
+        fullImageWidth: Int,
+        fullImageHeight: Int,
+        cropOffsetX: Int,
+        cropOffsetY: Int,
+        cropLeft: Float,
+        cropTop: Float,
+        cropRight: Float,
+        cropBottom: Float,
+    ): Boolean {
+        val representativePoint = computeHandRepresentativePoint(handLandmarks)
+        val fullXNorm = ((cropOffsetX + representativePoint.first * inputImageWidth) / fullImageWidth.toFloat())
+            .coerceIn(0f, 1f)
+        val fullYNorm = ((cropOffsetY + representativePoint.second * inputImageHeight) / fullImageHeight.toFloat())
+            .coerceIn(0f, 1f)
+
+        return fullXNorm in cropLeft..cropRight && fullYNorm in cropTop..cropBottom
+    }
+
+    private fun computeHandRepresentativePoint(handLandmarks: List<NormalizedLandmark>): Pair<Float, Float> {
+        val representativeLandmark = handLandmarks.getOrNull(INDEX_FINGER_TIP_INDEX)
+            ?: handLandmarks.firstOrNull()
+            ?: return 0f to 0f
+        return representativeLandmark.x() to representativeLandmark.y()
+    }
+
     companion object {
         val TAG = "GestureRecognizerHelper ${this.hashCode()}"
         private const val MP_RECOGNIZER_TASK = "gesture_recognizer.task"
@@ -600,6 +713,7 @@ class GestureRecognizerHelper(
         const val DEFAULT_HAND_PRESENCE_CONFIDENCE = 0.45F
         const val DEFAULT_HAND_TRACKING_CONFIDENCE = 0.40F
         const val DEFAULT_NUM_HANDS = 1
+        private const val INDEX_FINGER_TIP_INDEX = 12
         const val OTHER_ERROR = 0
         const val GPU_ERROR = 1
 
